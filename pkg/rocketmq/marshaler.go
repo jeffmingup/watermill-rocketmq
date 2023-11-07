@@ -35,8 +35,8 @@ func (DefaultMarshaler) Marshal(topic string, msg *message.Message) (*primitive.
 		Topic: topic,
 		Body:  msg.Payload,
 	}
-	m.WithProperty(UUIDHeaderKey, msg.UUID)
 	m.WithProperties(msg.Metadata)
+	m.WithProperty(UUIDHeaderKey, msg.UUID)
 
 	return m, nil
 }
