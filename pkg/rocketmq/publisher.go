@@ -13,7 +13,7 @@ import (
 )
 
 type Publisher struct {
-	config   PublisherConfig
+	config   *PublisherConfig
 	producer rocketmq.Producer
 	logger   watermill.LoggerAdapter
 
@@ -28,7 +28,7 @@ type PublisherConfig struct {
 
 // NewPublisher creates a new rocketmq Publisher.
 func NewPublisher(
-	config PublisherConfig,
+	config *PublisherConfig,
 	logger watermill.LoggerAdapter,
 ) (*Publisher, error) {
 	if logger == nil {
@@ -42,6 +42,9 @@ func NewPublisher(
 	if err != nil {
 		return nil, errors.Wrap(err, "rocketMQ producer start err")
 	}
+	if logger == nil {
+		logger = watermill.NopLogger{}
+	}
 	return &Publisher{
 		config:   config,
 		producer: p,
@@ -49,8 +52,8 @@ func NewPublisher(
 	}, nil
 }
 
-func DefaultPublisherConfig(addr ...string) PublisherConfig {
-	return PublisherConfig{
+func DefaultPublisherConfig(addr ...string) *PublisherConfig {
+	return &PublisherConfig{
 		Option: []producer.Option{
 			producer.WithNsResolver(primitive.NewPassthroughResolver(addr)),
 			producer.WithRetry(2),
@@ -69,11 +72,12 @@ func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 		return errors.New("publisher closed")
 	}
 
-	logFields := make(watermill.LogFields, 3)
+	logFields := make(watermill.LogFields, 4)
 	logFields["topic"] = topic
 
 	for _, msg := range msgs {
 		logFields["message_uuid"] = msg.UUID
+		logFields["Payload"] = string(msg.Payload)
 		p.logger.Trace("Sending message to Kafka", logFields)
 
 		rockerMQMsg, err := p.config.Marshaler.Marshal(topic, msg)

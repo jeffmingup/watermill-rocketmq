@@ -21,7 +21,7 @@ func main() {
 		msg := message.NewMessage(watermill.NewUUID(),
 			[]byte(fmt.Sprintf("Hello, world! %v", i)))
 		msg.Metadata.Set("SHARDING_KEY", "1") // 顺序消息需要设置 SHARDING_KEY,否则随机分配队列
-		if err := publisher.Publish("ming", msg); err != nil {
+		if err := publisher.Publish("topic_eae6d483-7b43-4b1b-a7d0-b62223480f3d_5", msg); err != nil {
 			panic(err)
 		}
 		time.Sleep(time.Second)

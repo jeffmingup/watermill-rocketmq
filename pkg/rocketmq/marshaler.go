@@ -1,12 +1,18 @@
 package rocketmq
 
 import (
+	"bytes"
+
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
-	"github.com/pkg/errors"
 )
 
-const UUIDHeaderKey = "_watermill_message_uuid"
+const (
+	UUIDHeaderKey = "_watermill_message_uuid"
+	placeholder   = "#placeholder"
+)
+
+var placeholderBytes = []byte(placeholder)
 
 // Marshaler marshals Watermill's message to rocketMQ message.
 type Marshaler interface {
@@ -15,7 +21,7 @@ type Marshaler interface {
 
 // Unmarshaler unmarshals rocketMQ's message to Watermill's message.
 type Unmarshaler interface {
-	Unmarshal(*primitive.MessageExt) (*message.Message, error)
+	Unmarshal(*primitive.Message) (*message.Message, error)
 }
 
 type MarshalerUnmarshaler interface {
@@ -28,20 +34,24 @@ var _ MarshalerUnmarshaler = &DefaultMarshaler{}
 type DefaultMarshaler struct{}
 
 func (DefaultMarshaler) Marshal(topic string, msg *message.Message) (*primitive.Message, error) {
-	if value := msg.Metadata.Get(UUIDHeaderKey); value != "" {
-		return nil, errors.Errorf("metadata %s is reserved by watermill for message UUID", UUIDHeaderKey)
+	if msg.Payload == nil {
+		msg.Payload = placeholderBytes
 	}
 	m := &primitive.Message{
 		Topic: topic,
 		Body:  msg.Payload,
 	}
-	m.WithProperties(msg.Metadata)
-	m.WithProperty(UUIDHeaderKey, msg.UUID)
+	property := msg.Metadata
+	if msg.UUID != "" {
+		property[UUIDHeaderKey] = msg.UUID
+	}
+
+	m.WithProperties(property)
 
 	return m, nil
 }
 
-func (DefaultMarshaler) Unmarshal(rocketmqMsg *primitive.MessageExt) (*message.Message, error) {
+func (DefaultMarshaler) Unmarshal(rocketmqMsg *primitive.Message) (*message.Message, error) {
 	var messageID string
 	metadata := make(message.Metadata, len(rocketmqMsg.GetProperties()))
 
@@ -52,7 +62,9 @@ func (DefaultMarshaler) Unmarshal(rocketmqMsg *primitive.MessageExt) (*message.M
 			metadata.Set(k, v)
 		}
 	}
-
+	if bytes.Equal(rocketmqMsg.Body, placeholderBytes) {
+		rocketmqMsg.Body = nil
+	}
 	msg := message.NewMessage(messageID, rocketmqMsg.Body)
 	msg.Metadata = metadata
 
