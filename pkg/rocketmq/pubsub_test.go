@@ -1,6 +1,7 @@
 package rocketmq_test
 
 import (
+	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"os"
 	"strings"
 	"testing"
@@ -9,7 +10,6 @@ import (
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/ThreeDotsLabs/watermill/pubsub/tests"
 	"github.com/apache/rocketmq-client-go/v2/producer"
-	"github.com/apache/rocketmq-client-go/v2/rlog"
 	"github.com/jeffmingup/watermill-rocketmq/pkg/rocketmq"
 )
 
@@ -22,7 +22,7 @@ func roctetMQBrokers() []string {
 }
 
 func TestPublishSubscribe(t *testing.T) {
-	rlog.SetLogLevel("error")
+	//rlog.SetLogLevel("error")
 	features := tests.Features{
 		ConsumerGroups:      true,
 		ExactlyOnceDelivery: false,
@@ -57,9 +57,11 @@ func newPubSub(t *testing.T, marshaler rocketmq.Marshaler, consumerGroup string)
 		t.Fatal(err)
 	}
 
+	SubscriberConfig := rocketmq.DefaultSubscriberConfig(consumerGroup, roctetMQBrokers()...)
+	SubscriberConfig.Option = append(SubscriberConfig.Option, consumer.WithConsumerOrder(true))
 	subscriber, err := rocketmq.NewSubscriber(
-		rocketmq.DefaultSubscriberConfig(consumerGroup, roctetMQBrokers()...),
-		watermill.NewStdLogger(false, false),
+		SubscriberConfig,
+		watermill.NewStdLogger(true, true),
 	)
 	if err != nil {
 		t.Fatal(err)

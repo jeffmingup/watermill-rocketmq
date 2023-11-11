@@ -41,11 +41,13 @@ func (DefaultMarshaler) Marshal(topic string, msg *message.Message) (*primitive.
 		Topic: topic,
 		Body:  msg.Payload,
 	}
-	property := msg.Metadata
+	property := make(map[string]string)
+	for k, v := range msg.Metadata {
+		property[k] = v
+	}
 	if msg.UUID != "" {
 		property[UUIDHeaderKey] = msg.UUID
 	}
-
 	m.WithProperties(property)
 
 	return m, nil

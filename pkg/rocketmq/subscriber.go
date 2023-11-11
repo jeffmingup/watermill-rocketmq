@@ -2,25 +2,27 @@ package rocketmq
 
 import (
 	"context"
-	"sync"
-
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/apache/rocketmq-client-go/v2"
+	"github.com/apache/rocketmq-client-go/v2/admin"
 	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
 	"github.com/pkg/errors"
+	"sync"
+	"time"
 )
 
 type SubscriberConfig struct {
 	// Unmarshaler is used to unmarshal messages from rocketMQ format into Watermill format.
 	Unmarshaler Unmarshaler
-
-	Option []consumer.Option
+	Addr        []string
+	Option      []consumer.Option
 }
 
 func DefaultSubscriberConfig(consumerGroup string, addr ...string) *SubscriberConfig {
 	return &SubscriberConfig{
+		Addr:        addr,
 		Unmarshaler: DefaultMarshaler{},
 		Option: []consumer.Option{
 			consumer.WithGroupName(consumerGroup),
@@ -82,15 +84,18 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	s.closed = false // mark as open
 	go func() {
 		<-s.closing
-		if err := s.pushConsumer.Shutdown(); err != nil {
-			s.logger.Error("cannot close rocketMQ consumer", err, logFields)
-		}
-		s.logger.Trace("Closing subscriber, cancelling consumeMessages", logFields)
+		cancel()
 		once.Do(func() {
 			close(output)
 		})
+		if err := s.pushConsumer.Shutdown(); err != nil {
+			s.logger.Error("cannot close rocketMQ consumer", err, logFields)
+		}
+
+		s.logger.Trace("Closing subscriber, cancelling consumeMessages", logFields)
+		time.Sleep(5 * time.Second)
 		s.subscribersWg.Done()
-		cancel()
+
 	}()
 
 	return output, nil
@@ -146,6 +151,7 @@ func (s *Subscriber) precessMsg(
 	receivedMsgLogFields = receivedMsgLogFields.Add(watermill.LogFields{
 		"message_uuid": msg.UUID,
 	})
+
 	select {
 	case output <- msg:
 		s.logger.Trace("Message sent to consumer", receivedMsgLogFields)
@@ -198,5 +204,31 @@ func (s *Subscriber) Close() error {
 	s.subscribersWg.Wait()
 
 	s.logger.Debug("rocketMQ subscriber closed", nil)
+	return nil
+}
+
+func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
+	rocketMQAdmin, err := admin.NewAdmin(admin.WithResolver(primitive.NewPassthroughResolver(s.config.Addr)))
+	if err != nil {
+		return err
+	}
+	topicList, err := rocketMQAdmin.FetchAllTopicList(context.Background())
+	if err != nil {
+		return err
+	}
+	for _, t := range topicList.TopicList {
+		if t == topic {
+			s.logger.Debug("topic 已存在无需创建"+topic, nil)
+			return nil
+		}
+	}
+	if err := rocketMQAdmin.CreateTopic(context.Background(), admin.WithTopicCreate(topic), admin.WithBrokerAddrCreate("192.168.144.47:10911")); err != nil {
+		return err
+	}
+	s.logger.Debug("CreateTopic ok "+topic, nil)
+	err = rocketMQAdmin.Close()
+	if err != nil {
+		return err
+	}
 	return nil
 }
