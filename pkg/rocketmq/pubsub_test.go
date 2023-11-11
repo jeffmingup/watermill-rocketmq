@@ -2,6 +2,7 @@ package rocketmq_test
 
 import (
 	"github.com/apache/rocketmq-client-go/v2/consumer"
+	"github.com/apache/rocketmq-client-go/v2/rlog"
 	"os"
 	"strings"
 	"testing"
@@ -22,7 +23,7 @@ func roctetMQBrokers() []string {
 }
 
 func TestPublishSubscribe(t *testing.T) {
-	//rlog.SetLogLevel("error")
+	rlog.SetLogLevel("error")
 	features := tests.Features{
 		ConsumerGroups:      true,
 		ExactlyOnceDelivery: false,
@@ -61,7 +62,7 @@ func newPubSub(t *testing.T, marshaler rocketmq.Marshaler, consumerGroup string)
 	SubscriberConfig.Option = append(SubscriberConfig.Option, consumer.WithConsumerOrder(true))
 	subscriber, err := rocketmq.NewSubscriber(
 		SubscriberConfig,
-		watermill.NewStdLogger(true, true),
+		watermill.NewStdLogger(false, false),
 	)
 	if err != nil {
 		t.Fatal(err)

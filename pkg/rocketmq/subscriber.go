@@ -15,18 +15,21 @@ import (
 
 type SubscriberConfig struct {
 	// Unmarshaler is used to unmarshal messages from rocketMQ format into Watermill format.
-	Unmarshaler Unmarshaler
-	Addr        []string
-	Option      []consumer.Option
+	Unmarshaler   Unmarshaler
+	Addr          []string
+	Option        []consumer.Option
+	consumerGroup string
 }
 
 func DefaultSubscriberConfig(consumerGroup string, addr ...string) *SubscriberConfig {
 	return &SubscriberConfig{
-		Addr:        addr,
-		Unmarshaler: DefaultMarshaler{},
+		consumerGroup: consumerGroup,
+		Addr:          addr,
+		Unmarshaler:   DefaultMarshaler{},
 		Option: []consumer.Option{
 			consumer.WithGroupName(consumerGroup),
 			consumer.WithNsResolver(primitive.NewPassthroughResolver(addr)),
+			consumer.WithMaxReconsumeTimes(2),
 		},
 	}
 }
@@ -37,14 +40,15 @@ type Subscriber struct {
 	closed        bool
 	closing       chan struct{}
 	subscribersWg sync.WaitGroup
-	pushConsumer  rocketmq.PushConsumer
+	pullConsumer  rocketmq.PullConsumer
 }
 
 func NewSubscriber(config *SubscriberConfig, logger watermill.LoggerAdapter) (*Subscriber, error) {
 	if logger == nil {
 		logger = watermill.NopLogger{}
 	}
-	pushConsumer, err := rocketmq.NewPushConsumer(config.Option...)
+	pullConsumer, err := rocketmq.NewPullConsumer(
+		config.Option...)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot create rocketMQ consumer")
 	}
@@ -53,88 +57,98 @@ func NewSubscriber(config *SubscriberConfig, logger watermill.LoggerAdapter) (*S
 		config:       config,
 		closed:       true,
 		closing:      make(chan struct{}),
-		pushConsumer: pushConsumer,
+		pullConsumer: pullConsumer,
 	}, nil
 }
 
 func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *message.Message, error) {
 	s.subscribersWg.Add(1)
 	logFields := watermill.LogFields{
-		"provider":            "rocketMQ",
-		"topic":               topic,
-		"kafka_consumer_uuid": watermill.NewShortUUID(),
+		"provider":      "rocketMQ poll",
+		"topic":         topic,
+		"consumerGroup": s.config.consumerGroup,
 	}
-	s.logger.Info("Subscribing to Kafka topic", logFields)
+	s.logger.Info("Subscribing to rocketMQ topic", logFields)
 	output := make(chan *message.Message)
-	once := &sync.Once{}
 
+	if err := s.pullConsumer.Subscribe(topic, consumer.MessageSelector{}); err != nil {
+		return nil, err
+	}
+	if err := s.pullConsumer.Start(); err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(ctx)
-	err := s.pushConsumer.Subscribe(topic, consumer.MessageSelector{}, s.consumeMessages(ctx, output, once, topic))
-	if err != nil {
+	go func() {
+		if err := s.Poll(ctx, output, logFields); err != nil {
+			s.logger.Error(" s.Poll Error", err, logFields)
+		}
+		close(output)
+	}()
+
+	if err := s.pullConsumer.Start(); err != nil {
 		s.subscribersWg.Done()
+		close(output)
 		cancel()
 		return nil, err
 	}
-	err = s.pushConsumer.Start()
-	if err != nil {
-		s.subscribersWg.Done()
-		cancel()
-		return nil, err
-	}
-	s.closed = false // mark as open
+	s.closed = false
 	go func() {
 		<-s.closing
 		cancel()
-		once.Do(func() {
-			close(output)
-		})
-		if err := s.pushConsumer.Shutdown(); err != nil {
+		if err := s.pullConsumer.Shutdown(); err != nil {
 			s.logger.Error("cannot close rocketMQ consumer", err, logFields)
 		}
-
 		s.logger.Trace("Closing subscriber, cancelling consumeMessages", logFields)
-		time.Sleep(5 * time.Second)
 		s.subscribersWg.Done()
 
 	}()
 
 	return output, nil
 }
-
-func (s *Subscriber) consumeMessages(
-	ctx context.Context, output chan *message.Message, once *sync.Once, topic string) func(
-	context.Context, ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
-	return func(_ context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
-		for _, m := range msgs {
-			select {
-			case <-ctx.Done():
-				once.Do(func() {
-					close(output)
-					if err := s.pushConsumer.Unsubscribe(topic); err != nil {
-						s.logger.Error("cannot Unsubscribe", err, watermill.LogFields{"topic": topic})
-					}
-				})
-				return consumer.SuspendCurrentQueueAMoment, nil
-			case <-s.closing:
-				return consumer.SuspendCurrentQueueAMoment, nil
-			default:
-				result, err := s.precessMsg(ctx, m, output, once, topic)
-				if err != nil {
-					return result, err
-				}
-				if result != consumer.ConsumeSuccess {
-					return result, err
-				}
+func (s *Subscriber) Poll(ctx context.Context, output chan *message.Message, logFields watermill.LogFields) error {
+pollLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			s.logger.Info("ctx.Done(), before Poll", logFields)
+			return nil
+		case <-s.closing:
+			s.logger.Info("s.closing,  before Poll", logFields)
+			return nil
+		default:
+			cr, err := s.pullConsumer.Poll(ctx, time.Second*5)
+			if consumer.IsNoNewMsgError(err) {
+				s.logger.Info("IsNoNewMsg：未拉取到消息", logFields)
+				continue
 			}
+			if err != nil {
+				s.logger.Error("poll error", err, logFields)
+				return err
+			}
+			s.logger.Trace("poll success", logFields.Add(watermill.LogFields{"cr": cr}))
+
+			for _, m := range cr.GetMsgList() {
+				err := s.precess(ctx, m, output)
+				if err != nil {
+					s.pullConsumer.ACK(context.TODO(), cr, consumer.ConsumeRetryLater)
+					if errors.Is(err, ErrMsgNackd) {
+						continue pollLoop // 继续拉取
+					} else {
+						return err
+					}
+				}
+
+			}
+			s.pullConsumer.ACK(context.TODO(), cr, consumer.ConsumeSuccess)
 		}
-		return consumer.ConsumeSuccess, nil
+
 	}
 }
 
-func (s *Subscriber) precessMsg(
-	ctx context.Context, m *primitive.MessageExt, output chan *message.Message, once *sync.Once, topic string) (
-	consumer.ConsumeResult, error,
-) {
+var ErrMsgNackd = errors.New("Message Nacked")
+
+func (s *Subscriber) precess(
+	ctx context.Context, m *primitive.MessageExt, output chan *message.Message) error {
 	receivedMsgLogFields := watermill.LogFields{
 		"OffsetMsgId": m.OffsetMsgId,
 		"QueueOffset": m.QueueOffset,
@@ -143,7 +157,7 @@ func (s *Subscriber) precessMsg(
 	}
 	msg, err := s.config.Unmarshaler.Unmarshal(&m.Message)
 	if err != nil {
-		return consumer.SuspendCurrentQueueAMoment, errors.Wrap(err, "message unmarshal failed")
+		return errors.Wrap(err, "message unmarshal failed")
 	}
 	ctx, cancelCtx := context.WithCancel(ctx)
 	msg.SetContext(ctx)
@@ -156,18 +170,11 @@ func (s *Subscriber) precessMsg(
 	case output <- msg:
 		s.logger.Trace("Message sent to consumer", receivedMsgLogFields)
 	case <-ctx.Done():
-		s.logger.Trace("Closing, ctx cancelled before sent to consumer", receivedMsgLogFields)
-
-		once.Do(func() {
-			close(output)
-			if err := s.pushConsumer.Unsubscribe(topic); err != nil {
-				s.logger.Error("cannot Unsubscribe", err, watermill.LogFields{"topic": topic})
-			}
-		})
-		return consumer.SuspendCurrentQueueAMoment, nil
+		s.logger.Info(" ctx cancelled before sent to consumer", receivedMsgLogFields)
+		return errors.New(" ctx cancelled before sent to consumer")
 	case <-s.closing:
-		s.logger.Trace("Closing, s.closing before sent to consumer", receivedMsgLogFields)
-		return consumer.SuspendCurrentQueueAMoment, nil
+		s.logger.Info("s.closing before sent to consumer", receivedMsgLogFields)
+		return errors.New("s.closing before sent to consumer")
 	}
 
 	select {
@@ -175,23 +182,16 @@ func (s *Subscriber) precessMsg(
 		s.logger.Trace("Message Acked", receivedMsgLogFields)
 
 	case <-msg.Nacked():
-		s.logger.Trace("Message Nacked", receivedMsgLogFields)
-		return consumer.SuspendCurrentQueueAMoment, nil
+		s.logger.Info("Message Nacked", receivedMsgLogFields)
+		return ErrMsgNackd
 	case <-ctx.Done():
-		s.logger.Trace("Closing, ctx cancelled before ack", receivedMsgLogFields)
-
-		once.Do(func() {
-			close(output)
-			if err := s.pushConsumer.Unsubscribe(topic); err != nil {
-				s.logger.Error("cannot Unsubscribe", err, watermill.LogFields{"topic": topic})
-			}
-		})
-		return consumer.SuspendCurrentQueueAMoment, nil
+		s.logger.Info("Closing, ctx cancelled before ack", receivedMsgLogFields)
+		return errors.New("Closing, ctx cancelled before ack")
 	case <-s.closing:
-		s.logger.Trace("Closing, s.closing before sent to consumer", receivedMsgLogFields)
-		return consumer.SuspendCurrentQueueAMoment, nil
+		s.logger.Info("Closing, s.closing before sent to consumer", receivedMsgLogFields)
+		return errors.New("Closing, s.closing before sent to consumer")
 	}
-	return consumer.ConsumeSuccess, nil
+	return nil
 }
 
 func (s *Subscriber) Close() error {
