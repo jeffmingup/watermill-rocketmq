@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/apache/rocketmq-client-go/v2/consumer"
+	"github.com/apache/rocketmq-client-go/v2/rlog"
 	"log"
 	"os"
 	"strconv"
@@ -19,16 +20,24 @@ import (
 	"github.com/jeffmingup/watermill-rocketmq/pkg/rocketmq"
 )
 
-func roctetMQBrokers() []string {
-	brokers := os.Getenv("WATERMILL_TEST_ROCTETMQ_BROKERS")
-	if brokers != "" {
-		return strings.Split(brokers, ",")
+func rocketMQAddr() []string {
+	addr := os.Getenv("WATERMILL_TEST_ROCTETMQ_Addr")
+	if addr != "" {
+		return strings.Split(addr, ",")
 	}
-	return []string{"192.168.169.203:9876"}
+	return []string{"127.0.0.1:9876"}
+}
+
+func rocketMQBrokerAddr() string {
+	addr := os.Getenv("WATERMILL_TEST_ROCTETMQ_BROCKER_Addr")
+	if addr != "" {
+		return addr
+	}
+	return "127.0.0.1:10911"
 }
 
 func TestPublishSubscribe(t *testing.T) {
-	//rlog.SetLogLevel("error")
+	rlog.SetLogLevel("error")
 	features := tests.Features{
 		ConsumerGroups:      true,
 		ExactlyOnceDelivery: false,
@@ -51,26 +60,26 @@ func createPubSub(t *testing.T) (message.Publisher, message.Subscriber) {
 }
 
 func createPubSubWithConsumerGrup(t *testing.T, consumerGroup string) (message.Publisher, message.Subscriber) {
-	return newPubSub(t, rocketmq.DefaultMarshaler{}, consumerGroup)
+	return newPubSub(t, consumerGroup)
 }
 
-func newPubSub(t *testing.T, marshaler rocketmq.Marshaler, consumerGroup string) (message.Publisher, message.Subscriber) {
-	PublisherConfig := rocketmq.DefaultPublisherConfig(roctetMQBrokers()...)
-	PublisherConfig.Option = append(PublisherConfig.Option, producer.WithGroupName("testGroup_"+string(tests.NewTestID())))
+func newPubSub(t *testing.T, consumerGroup string) (message.Publisher, message.Subscriber) {
+	PublisherConfig := rocketmq.DefaultPublisherConfig(rocketMQAddr()...)
 	publisher, err := rocketmq.NewPublisher(
 		PublisherConfig,
-		watermill.NewStdLogger(false, false),
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	SubscriberConfig := rocketmq.DefaultSubscriberConfig(consumerGroup, roctetMQBrokers()...)
+	SubscriberConfig := rocketmq.DefaultSubscriberConfig(consumerGroup, rocketMQAddr()...)
 	SubscriberConfig.ConsumeOrderly = true
+	SubscriberConfig.BrokerAddr = rocketMQBrokerAddr()
 	SubscriberConfig.Option = append(SubscriberConfig.Option, consumer.WithConsumeMessageBatchMaxSize(50))
 	subscriber, err := rocketmq.NewSubscriber(
 		SubscriberConfig,
-		watermill.NewStdLogger(true, true),
+		nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +89,7 @@ func newPubSub(t *testing.T, marshaler rocketmq.Marshaler, consumerGroup string)
 }
 
 func TestDefaultSubscriberInitialize(t *testing.T) {
-	SubscriberConfig := rocketmq.DefaultSubscriberConfig("test", roctetMQBrokers()...)
+	SubscriberConfig := rocketmq.DefaultSubscriberConfig("test", rocketMQAddr()...)
 	SubscriberConfig.ConsumeOrderly = true
 	subscriber, err := rocketmq.NewSubscriber(
 		SubscriberConfig,
@@ -106,7 +115,7 @@ func TestDefaultSubscriberInitialize(t *testing.T) {
 }
 
 func TestPoll(t *testing.T) {
-	SubscriberConfig := rocketmq.DefaultSubscriberConfig("test_ming_1", roctetMQBrokers()...)
+	SubscriberConfig := rocketmq.DefaultSubscriberConfig("test_ming_1", rocketMQAddr()...)
 	SubscriberConfig.ConsumeOrderly = true
 	SubscriberConfig.Option = append(SubscriberConfig.Option, consumer.WithConsumeMessageBatchMaxSize(50))
 	subscriber, err := rocketmq.NewSubscriber(
@@ -117,7 +126,7 @@ func TestPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	PublisherConfig := rocketmq.DefaultPublisherConfig(roctetMQBrokers()...)
+	PublisherConfig := rocketmq.DefaultPublisherConfig(rocketMQAddr()...)
 	PublisherConfig.Option = append(PublisherConfig.Option, producer.WithGroupName("testGroup_"+string(tests.NewTestID())))
 	publisher, err := rocketmq.NewPublisher(
 		PublisherConfig,
@@ -142,12 +151,12 @@ func TestPoll(t *testing.T) {
 		go func(i int) {
 			tName := topicName + strconv.Itoa(i)
 			if err := publisher.Publish(tName, messagesToPublish...); err != nil {
-				t.Fatal(err)
+				t.Error(err)
 			}
 
 			msgChan, err := subscriber.Subscribe(context.Background(), tName)
 			if err != nil {
-				t.Fatal(err)
+				t.Error(err)
 			}
 			for msg := range msgChan {
 				log.Println(msg.UUID, string(msg.Payload))

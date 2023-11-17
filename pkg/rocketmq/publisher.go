@@ -58,6 +58,7 @@ func DefaultPublisherConfig(addr ...string) *PublisherConfig {
 			producer.WithNsResolver(primitive.NewPassthroughResolver(addr)),
 			producer.WithRetry(2),
 			producer.WithQueueSelector(producer.NewHashQueueSelector()),
+			producer.WithGroupName(watermill.NewUUID()),
 		},
 		Marshaler: DefaultMarshaler{},
 	}
@@ -92,7 +93,7 @@ func (p *Publisher) Publish(topic string, msgs ...*message.Message) error {
 
 		logFields["rocketmq_send_result"] = res
 
-		p.logger.Trace("Message sent to Kafka", logFields)
+		p.logger.Trace("Message sent to rocketMQ", logFields)
 	}
 
 	return nil

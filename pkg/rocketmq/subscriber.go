@@ -17,13 +17,15 @@ type SubscriberConfig struct {
 	// Unmarshaler is used to unmarshal messages from rocketMQ format into Watermill format.
 	Unmarshaler    Unmarshaler
 	Addr           []string
+	BrokerAddr     string // SubscribeInitialize create topic need brokerAddr，
 	Option         []consumer.Option
 	consumerGroup  string
 	ConsumeOrderly bool
+	PollTimeout    time.Duration
 }
 
-func DefaultSubscriberConfig(consumerGroup string, addr ...string) *SubscriberConfig {
-	return &SubscriberConfig{
+func DefaultSubscriberConfig(consumerGroup string, addr ...string) SubscriberConfig {
+	return SubscriberConfig{
 		consumerGroup: consumerGroup,
 		Addr:          addr,
 		Unmarshaler:   DefaultMarshaler{},
@@ -31,21 +33,20 @@ func DefaultSubscriberConfig(consumerGroup string, addr ...string) *SubscriberCo
 			consumer.WithNsResolver(primitive.NewPassthroughResolver(addr)),
 			consumer.WithMaxReconsumeTimes(2),
 		},
+		PollTimeout: time.Second * 3,
 	}
 }
 
 type Subscriber struct {
-	config         *SubscriberConfig
+	config         SubscriberConfig
 	logger         watermill.LoggerAdapter
 	closed         bool
 	closing        chan struct{}
 	subscribersWg  sync.WaitGroup
-	once           sync.Once
 	InitializeLock sync.Mutex
-	StartLock      sync.Mutex
 }
 
-func NewSubscriber(config *SubscriberConfig, logger watermill.LoggerAdapter) (*Subscriber, error) {
+func NewSubscriber(config SubscriberConfig, logger watermill.LoggerAdapter) (*Subscriber, error) {
 	if logger == nil {
 		logger = watermill.NopLogger{}
 	}
@@ -66,11 +67,14 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	}
 	s.logger.Info("Subscribing to rocketMQ topic", logFields)
 
-	s.StartLock.Lock()
-	s.config.Option = append(s.config.Option, consumer.WithInstance(watermill.NewUUID()))
-	s.config.Option = append(s.config.Option, consumer.WithGroupName(s.config.consumerGroup+"_"+topic))
+	option := make([]consumer.Option, len(s.config.Option))
+	copy(option, s.config.Option)
+	option = append(option,
+		consumer.WithInstance(watermill.NewUUID()),
+		consumer.WithGroupName(s.config.consumerGroup+"_"+topic))
+
 	pullConsumer, err := rocketmq.NewPullConsumer(
-		s.config.Option...)
+		option...)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot create rocketMQ consumer")
 	}
@@ -81,7 +85,6 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	if err := pullConsumer.Start(); err != nil {
 		s.logger.Error("pullConsumer.Start error", err, logFields)
 	}
-	s.StartLock.Unlock()
 
 	s.subscribersWg.Add(1)
 	go func() {
@@ -112,7 +115,7 @@ pollLoop:
 			s.logger.Info("s.closing,  before Poll", logFields)
 			return nil
 		default:
-			cr, err := pullConsumer.Poll(ctx, time.Second)
+			cr, err := pullConsumer.Poll(ctx, s.config.PollTimeout)
 			if consumer.IsNoNewMsgError(err) {
 				s.logger.Trace("IsNoNewMsg：未拉取到消息", logFields.Add(watermill.LogFields{"cr": cr}))
 				continue
@@ -218,21 +221,14 @@ var InitializeLock sync.Mutex
 func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
 	InitializeLock.Lock()
 	defer InitializeLock.Unlock()
+	if s.config.BrokerAddr == "" {
+		return nil
+	}
 	rocketMQAdmin, err := admin.NewAdmin(admin.WithResolver(primitive.NewPassthroughResolver(s.config.Addr)))
 	if err != nil {
 		return err
 	}
-	topicList, err := rocketMQAdmin.FetchAllTopicList(context.Background())
-	if err != nil {
-		return err
-	}
-	for _, t := range topicList.TopicList {
-		if t == topic {
-			s.logger.Debug("topic 已存在无需创建"+topic, nil)
-			return nil
-		}
-	}
-	if err := rocketMQAdmin.CreateTopic(context.Background(), admin.WithTopicCreate(topic), admin.WithBrokerAddrCreate("192.168.144.47:10911")); err != nil {
+	if err := rocketMQAdmin.CreateTopic(context.Background(), admin.WithTopicCreate(topic), admin.WithBrokerAddrCreate(s.config.BrokerAddr)); err != nil {
 		return err
 	}
 	s.logger.Debug("CreateTopic ok "+topic, nil)
