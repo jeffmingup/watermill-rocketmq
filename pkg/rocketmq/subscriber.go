@@ -15,13 +15,15 @@ import (
 
 type SubscriberConfig struct {
 	// Unmarshaler is used to unmarshal messages from rocketMQ format into Watermill format.
-	Unmarshaler    Unmarshaler
-	Addr           []string
-	BrokerAddr     string // SubscribeInitialize create topic need brokerAddr，
-	Option         []consumer.Option
-	consumerGroup  string
-	ConsumeOrderly bool
-	PollTimeout    time.Duration
+	Unmarshaler            Unmarshaler
+	Addr                   []string
+	BrokerAddr             string // SubscribeInitialize create topic need brokerAddr，
+	Option                 []consumer.Option
+	consumerGroup          string
+	ConsumeOrderly         bool
+	NackResendSleep        time.Duration // How long after Nack message should be redelivered.
+	PollTimeout            time.Duration // Poll messages with timeout.
+	InitializeTopicOptions []admin.OptionCreate
 }
 
 func DefaultSubscriberConfig(consumerGroup string, addr ...string) SubscriberConfig {
@@ -33,17 +35,17 @@ func DefaultSubscriberConfig(consumerGroup string, addr ...string) SubscriberCon
 			consumer.WithNsResolver(primitive.NewPassthroughResolver(addr)),
 			consumer.WithMaxReconsumeTimes(2),
 		},
-		PollTimeout: time.Second * 3,
+		PollTimeout:     time.Second * 3,
+		NackResendSleep: time.Second,
 	}
 }
 
 type Subscriber struct {
-	config         SubscriberConfig
-	logger         watermill.LoggerAdapter
-	closed         bool
-	closing        chan struct{}
-	subscribersWg  sync.WaitGroup
-	InitializeLock sync.Mutex
+	config        SubscriberConfig
+	logger        watermill.LoggerAdapter
+	closed        bool
+	closing       chan struct{}
+	subscribersWg sync.WaitGroup
 }
 
 func NewSubscriber(config SubscriberConfig, logger watermill.LoggerAdapter) (*Subscriber, error) {
@@ -92,7 +94,7 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 			close(output)
 			err := pullConsumer.Shutdown()
 			if err != nil {
-				s.logger.Error("Closing subscriber, cancelling consumeMessages", err, logFields)
+				s.logger.Error("pullConsumer Shutdown error", err, logFields)
 			}
 			s.logger.Info("Closing subscriber, cancelling consumeMessages", logFields)
 			s.subscribersWg.Done()
@@ -104,8 +106,9 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	s.closed = false
 	return output, nil
 }
+
 func (s *Subscriber) Poll(ctx context.Context, output chan *message.Message, pullConsumer rocketmq.PullConsumer, logFields watermill.LogFields) error {
-pollLoop:
+	//pollLoop:
 	for {
 		select {
 		case <-ctx.Done():
@@ -117,45 +120,46 @@ pollLoop:
 		default:
 			cr, err := pullConsumer.Poll(ctx, s.config.PollTimeout)
 			if consumer.IsNoNewMsgError(err) {
-				s.logger.Trace("IsNoNewMsg：未拉取到消息", logFields.Add(watermill.LogFields{"cr": cr}))
+				s.logger.Trace("No new msg", logFields.Add(watermill.LogFields{"cr": cr}))
 				continue
 			}
 			if err != nil {
-				s.logger.Error("poll error", err, logFields)
+				s.logger.Error("Poll error", err, logFields)
 				return err
 			}
-			s.logger.Trace("poll success", logFields.Add(watermill.LogFields{"cr": cr, "len(msg)": len(cr.GetMsgList()), "msg": cr.GetMsgList()[0].Message.GetProperty("_watermill_message_uuid"), "GetMQ": cr.GetMQ(), "GetPQ": cr.GetPQ()}))
+			s.logger.Trace("Poll msg success", logFields.Add(watermill.LogFields{"cr": cr, "number of messages": len(cr.GetMsgList()), "GetMQ": cr.GetMQ()}))
 			for _, m := range cr.GetMsgList() {
 				err := s.precess(ctx, m, output)
 				if err != nil {
-					if !s.config.ConsumeOrderly {
-						pullConsumer.ACK(context.TODO(), cr, consumer.ConsumeRetryLater)
+					if errors.Is(err, ErrSubscriberClose) || errors.Is(err, ErrCtxDone) {
+						return nil
 					}
-
+					if !s.config.ConsumeOrderly {
+						pullConsumer.ACK(ctx, cr, consumer.ConsumeRetryLater)
+					}
 					if errors.Is(err, ErrMsgNackd) {
-						continue pollLoop // 继续拉取
+						//continue pollLoop
 					} else {
 						return err
 					}
 				}
 
 			}
-			pullConsumer.ACK(context.TODO(), cr, consumer.ConsumeSuccess)
+			pullConsumer.ACK(ctx, cr, consumer.ConsumeSuccess)
 		}
 
 	}
 }
 
 var ErrMsgNackd = errors.New("Message Nacked")
+var ErrSubscriberClose = errors.New("Subscriber Closing")
+var ErrCtxDone = errors.New("ctx.Done")
 
 func (s *Subscriber) precess(
 	ctx context.Context, m *primitive.MessageExt, output chan *message.Message) error {
 
 	receivedMsgLogFields := watermill.LogFields{
-		"OffsetMsgId": m.OffsetMsgId,
-		"QueueOffset": m.QueueOffset,
-		"Queue":       m.Queue.String(),
-		"Payload":     string(m.Body),
+		"msg": m,
 	}
 	msg, err := s.config.Unmarshaler.Unmarshal(&m.Message)
 	if err != nil {
@@ -174,11 +178,11 @@ precessLoop:
 		case output <- msg:
 			s.logger.Trace("Message sent to consumer", receivedMsgLogFields)
 		case <-ctx.Done():
-			s.logger.Info(" ctx cancelled before sent to consumer", receivedMsgLogFields)
-			return errors.New(" ctx cancelled before sent to consumer")
+			s.logger.Info("Closing, ctx cancelled before sent to consumer", receivedMsgLogFields)
+			return ErrCtxDone
 		case <-s.closing:
-			s.logger.Info("s.closing before sent to consumer", receivedMsgLogFields)
-			return errors.New("s.closing before sent to consumer")
+			s.logger.Info("Closing, message discarded", receivedMsgLogFields)
+			return ErrSubscriberClose
 		}
 
 		select {
@@ -188,16 +192,19 @@ precessLoop:
 		case <-msg.Nacked():
 			s.logger.Info("Message Nacked", receivedMsgLogFields)
 			if s.config.ConsumeOrderly {
+				if s.config.NackResendSleep != 0 {
+					time.Sleep(s.config.NackResendSleep)
+				}
 				msg = msg.Copy()
-				continue precessLoop // 顺序消费，不可以跳过消息
+				continue precessLoop // order consumption, messages cannot be skipped
 			}
 			return ErrMsgNackd
 		case <-ctx.Done():
 			s.logger.Info("Closing, ctx cancelled before ack", receivedMsgLogFields)
-			return errors.New("Closing, ctx cancelled before ack")
+			return ErrCtxDone
 		case <-s.closing:
-			s.logger.Info("Closing, s.closing before sent to consumer", receivedMsgLogFields)
-			return errors.New("Closing, s.closing before sent to consumer")
+			s.logger.Info("Closing, message discarded before ack", receivedMsgLogFields)
+			return ErrSubscriberClose
 		}
 	}
 	return nil
@@ -207,7 +214,7 @@ func (s *Subscriber) Close() error {
 	if s.closed {
 		return nil
 	}
-	s.logger.Info("Closing subscriber.", nil)
+	s.logger.Info("Closing subscriber", nil)
 	s.closed = true
 
 	close(s.closing)
@@ -216,24 +223,33 @@ func (s *Subscriber) Close() error {
 	return nil
 }
 
-var InitializeLock sync.Mutex
+// InitializeLock Concurrent creation of topic may cause timeout
+var InitializeLock sync.Mutex //
 
 func (s *Subscriber) SubscribeInitialize(topic string) (err error) {
-	InitializeLock.Lock()
-	defer InitializeLock.Unlock()
-	if s.config.BrokerAddr == "" {
+	if len(s.config.InitializeTopicOptions) == 0 {
 		return nil
 	}
+	InitializeLock.Lock()
+	defer InitializeLock.Unlock()
+
 	rocketMQAdmin, err := admin.NewAdmin(admin.WithResolver(primitive.NewPassthroughResolver(s.config.Addr)))
 	if err != nil {
+		s.logger.Error("NewAdmin error ", err, watermill.LogFields{"Addr": s.config.Addr})
 		return err
 	}
-	if err := rocketMQAdmin.CreateTopic(context.Background(), admin.WithTopicCreate(topic), admin.WithBrokerAddrCreate(s.config.BrokerAddr)); err != nil {
+	option := make([]admin.OptionCreate, len(s.config.InitializeTopicOptions))
+	copy(option, s.config.InitializeTopicOptions)
+	option = append(option, admin.WithTopicCreate(topic))
+
+	if err := rocketMQAdmin.CreateTopic(context.Background(), option...); err != nil {
+		s.logger.Error("CreateTopic error ", err, watermill.LogFields{"topic": topic})
 		return err
 	}
-	s.logger.Debug("CreateTopic ok "+topic, nil)
+	s.logger.Trace("CreateTopic success ", watermill.LogFields{"topic": topic})
 	err = rocketMQAdmin.Close()
 	if err != nil {
+		s.logger.Error("rocketMQAdmin Close error ", err, watermill.LogFields{"topic": topic})
 		return err
 	}
 	return nil

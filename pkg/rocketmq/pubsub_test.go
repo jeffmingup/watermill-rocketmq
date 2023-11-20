@@ -3,6 +3,7 @@ package rocketmq_test
 import (
 	"context"
 	"fmt"
+	"github.com/apache/rocketmq-client-go/v2/admin"
 	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/rlog"
 	"log"
@@ -39,10 +40,13 @@ func rocketMQBrokerAddr() string {
 func TestPublishSubscribe(t *testing.T) {
 	rlog.SetLogLevel("error")
 	features := tests.Features{
-		ConsumerGroups:      true,
-		ExactlyOnceDelivery: false,
-		GuaranteedOrder:     true,
-		Persistent:          true,
+		ConsumerGroups:                   true,
+		ExactlyOnceDelivery:              false,
+		GuaranteedOrder:                  true,
+		Persistent:                       true,
+		RequireSingleInstance:            true,
+		NewSubscriberReceivesOldMessages: false,
+		//RestartServiceCommand:            []string{"docker", "restart", "rmqbroker"},
 	}
 
 	tests.TestPubSub(
@@ -75,8 +79,10 @@ func newPubSub(t *testing.T, consumerGroup string) (message.Publisher, message.S
 
 	SubscriberConfig := rocketmq.DefaultSubscriberConfig(consumerGroup, rocketMQAddr()...)
 	SubscriberConfig.ConsumeOrderly = true
-	SubscriberConfig.BrokerAddr = rocketMQBrokerAddr()
+	SubscriberConfig.NackResendSleep = 0
+
 	SubscriberConfig.Option = append(SubscriberConfig.Option, consumer.WithConsumeMessageBatchMaxSize(50))
+	SubscriberConfig.InitializeTopicOptions = []admin.OptionCreate{admin.WithBrokerAddrCreate(rocketMQBrokerAddr())}
 	subscriber, err := rocketmq.NewSubscriber(
 		SubscriberConfig,
 		nil,
