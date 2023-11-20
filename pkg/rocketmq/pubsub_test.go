@@ -42,11 +42,11 @@ func TestPublishSubscribe(t *testing.T) {
 	features := tests.Features{
 		ConsumerGroups:                   true,
 		ExactlyOnceDelivery:              false,
-		GuaranteedOrder:                  true,
+		GuaranteedOrder:                  false,
 		Persistent:                       true,
 		RequireSingleInstance:            true,
 		NewSubscriberReceivesOldMessages: false,
-		//RestartServiceCommand:            []string{"docker", "restart", "rmqbroker"},
+		RestartServiceCommand:            []string{"docker", "restart", "rmqbroker"},
 	}
 
 	tests.TestPubSub(
@@ -85,7 +85,7 @@ func newPubSub(t *testing.T, consumerGroup string) (message.Publisher, message.S
 	SubscriberConfig.InitializeTopicOptions = []admin.OptionCreate{admin.WithBrokerAddrCreate(rocketMQBrokerAddr())}
 	subscriber, err := rocketmq.NewSubscriber(
 		SubscriberConfig,
-		nil,
+		watermill.NewStdLogger(false, false),
 	)
 	if err != nil {
 		t.Fatal(err)

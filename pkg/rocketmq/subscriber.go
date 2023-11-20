@@ -10,6 +10,7 @@ import (
 	"github.com/apache/rocketmq-client-go/v2/primitive"
 	"github.com/pkg/errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,12 +18,10 @@ type SubscriberConfig struct {
 	// Unmarshaler is used to unmarshal messages from rocketMQ format into Watermill format.
 	Unmarshaler            Unmarshaler
 	Addr                   []string
-	BrokerAddr             string // SubscribeInitialize create topic need brokerAddr，
 	Option                 []consumer.Option
 	consumerGroup          string
 	ConsumeOrderly         bool
 	NackResendSleep        time.Duration // How long after Nack message should be redelivered.
-	PollTimeout            time.Duration // Poll messages with timeout.
 	InitializeTopicOptions []admin.OptionCreate
 }
 
@@ -35,7 +34,6 @@ func DefaultSubscriberConfig(consumerGroup string, addr ...string) SubscriberCon
 			consumer.WithNsResolver(primitive.NewPassthroughResolver(addr)),
 			consumer.WithMaxReconsumeTimes(2),
 		},
-		PollTimeout:     time.Second * 3,
 		NackResendSleep: time.Second,
 	}
 }
@@ -61,6 +59,8 @@ func NewSubscriber(config SubscriberConfig, logger watermill.LoggerAdapter) (*Su
 	}, nil
 }
 
+var mm int32
+
 func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *message.Message, error) {
 	logFields := watermill.LogFields{
 		"provider":      "rocketMQ poll",
@@ -75,80 +75,59 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 		consumer.WithInstance(watermill.NewUUID()),
 		consumer.WithGroupName(s.config.consumerGroup+"_"+topic))
 
-	pullConsumer, err := rocketmq.NewPullConsumer(
+	pushConsumer, err := rocketmq.NewPushConsumer(
 		option...)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot create rocketMQ consumer")
 	}
 	output := make(chan *message.Message)
-	if err := pullConsumer.Subscribe(topic, consumer.MessageSelector{}); err != nil {
+	if err := pushConsumer.Subscribe(topic, consumer.MessageSelector{}, func(_ context.Context,
+		msgs ...*primitive.MessageExt,
+	) (consumer.ConsumeResult, error) {
+
+		atomic.AddInt32(&mm, int32(len(msgs)))
+		if mm > 9900 {
+			s.logger.Info("消息总数", watermill.LogFields{"i": mm})
+		}
+		for _, msg := range msgs {
+			err := s.precess(ctx, msg, output)
+			if err != nil {
+				if errors.Is(err, ErrSubscriberClose) || errors.Is(err, ErrCtxDone) {
+					return consumer.SuspendCurrentQueueAMoment, nil
+				}
+				return consumer.ConsumeRetryLater, nil
+			}
+
+		}
+		return consumer.ConsumeSuccess, nil
+	}); err != nil {
 		return nil, err
 	}
-	if err := pullConsumer.Start(); err != nil {
-		s.logger.Error("pullConsumer.Start error", err, logFields)
+	if err := pushConsumer.Start(); err != nil {
+		s.logger.Error("pushConsumer.Start error", err, logFields)
 	}
 
 	s.subscribersWg.Add(1)
 	go func() {
 		defer func() {
 			close(output)
-			err := pullConsumer.Shutdown()
+			err := pushConsumer.Shutdown()
 			if err != nil {
-				s.logger.Error("pullConsumer Shutdown error", err, logFields)
+				s.logger.Error("pushConsumer Shutdown error", err, logFields)
 			}
 			s.logger.Info("Closing subscriber, cancelling consumeMessages", logFields)
 			s.subscribersWg.Done()
 		}()
-		if err := s.Poll(ctx, output, pullConsumer, logFields); err != nil {
-			s.logger.Error(" s.Poll Error", err, logFields)
+		select {
+		case <-s.closing:
+			s.logger.Info("s.closing", logFields)
+		case <-ctx.Done():
+			s.logger.Info("ctx.Done()", logFields)
 		}
+
 	}()
 	s.closed = false
 	return output, nil
-}
-
-func (s *Subscriber) Poll(ctx context.Context, output chan *message.Message, pullConsumer rocketmq.PullConsumer, logFields watermill.LogFields) error {
-	//pollLoop:
-	for {
-		select {
-		case <-ctx.Done():
-			s.logger.Info("ctx.Done(), before Poll", logFields)
-			return nil
-		case <-s.closing:
-			s.logger.Info("s.closing,  before Poll", logFields)
-			return nil
-		default:
-			cr, err := pullConsumer.Poll(ctx, s.config.PollTimeout)
-			if consumer.IsNoNewMsgError(err) {
-				s.logger.Trace("No new msg", logFields.Add(watermill.LogFields{"cr": cr}))
-				continue
-			}
-			if err != nil {
-				s.logger.Error("Poll error", err, logFields)
-				return err
-			}
-			s.logger.Trace("Poll msg success", logFields.Add(watermill.LogFields{"cr": cr, "number of messages": len(cr.GetMsgList()), "GetMQ": cr.GetMQ()}))
-			for _, m := range cr.GetMsgList() {
-				err := s.precess(ctx, m, output)
-				if err != nil {
-					if errors.Is(err, ErrSubscriberClose) || errors.Is(err, ErrCtxDone) {
-						return nil
-					}
-					if !s.config.ConsumeOrderly {
-						pullConsumer.ACK(ctx, cr, consumer.ConsumeRetryLater)
-					}
-					if errors.Is(err, ErrMsgNackd) {
-						//continue pollLoop
-					} else {
-						return err
-					}
-				}
-
-			}
-			pullConsumer.ACK(ctx, cr, consumer.ConsumeSuccess)
-		}
-
-	}
 }
 
 var ErrMsgNackd = errors.New("Message Nacked")
